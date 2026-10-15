@@ -63,10 +63,14 @@ jobs:
                   jvmTarget = '17'
               }
           }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.8.0'
+          }
           EOF_FILE
           cat > gradle.properties <<'EOF_FILE'
           org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
-          android.useAndroidX=false
+          android.useAndroidX=true
           EOF_FILE
           cat > src/main/AndroidManifest.xml <<'EOF_FILE'
           <?xml version="1.0" encoding="utf-8"?>
@@ -185,6 +189,7 @@ jobs:
                   }
                   secRow.addView(secsEt)
                   root.addView(secRow, LinearLayout.LayoutParams(mp, wc))
+
                   status = TextView(this).apply {
                       textSize = 13f
                       text = "Ready"
@@ -373,10 +378,13 @@ jobs:
           import android.webkit.WebResourceRequest
           import android.webkit.WebResourceResponse
           import android.webkit.WebSettings
+          import android.webkit.WebStorage
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import android.widget.LinearLayout
           import android.widget.TextView
+          import androidx.webkit.WebSettingsCompat
+          import androidx.webkit.WebViewFeature
           import java.io.ByteArrayInputStream
           import kotlin.math.abs
 
@@ -462,7 +470,7 @@ jobs:
                 if(!list.length) continue;
                 var b=list[0];
                 var last=parseInt(b.getAttribute('data-lg')||'0');
-                if(now-last<7000) return 'waiting...';
+                if(now-last<4000) return 'waiting...';
                 b.setAttribute('data-lg',String(now));
                 b.click();
                 return 'clicked '+order[j];
@@ -505,7 +513,7 @@ jobs:
                               setStatus("(${idx + 1}/${queue.size}) ${label()}: " + (r ?: "").trim('"'))
                           }
                       }
-                      h.postDelayed(this, 1000)
+                      h.postDelayed(this, 500)
                   }
               }
 
@@ -638,6 +646,15 @@ jobs:
                   s.setSupportMultipleWindows(true)
                   s.mediaPlaybackRequiresUserGesture = true
                   s.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                  s.blockNetworkImage = true // faster pages
+                  // Look like normal mobile Chrome instead of an in-app browser
+                  s.userAgentString = s.userAgentString.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
+                  try {
+                      if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                          WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, emptySet())
+                      }
+                  } catch (_: Exception) {
+                  }
                   CookieManager.getInstance().setAcceptCookie(true)
                   CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
 
@@ -825,9 +842,32 @@ jobs:
                   done = false
                   startedAt = System.currentTimeMillis()
                   setStatus("(${idx + 1}/${queue.size}) ${label()} download: loading...", true)
-                  web?.loadUrl(queue[idx])
                   h.removeCallbacks(tick)
-                  h.postDelayed(tick, 2000)
+                  clearSession {
+                      if (running && !done) {
+                          web?.loadUrl(queue[idx])
+                          h.postDelayed(tick, 600)
+                      }
+                  }
+              }
+
+              // Every attempt starts with a clean browser: no old cookies, saved data, cache or history.
+              private fun clearSession(then: () -> Unit) {
+                  val w = web
+                  if (w == null) {
+                      then()
+                      return
+                  }
+                  try {
+                      w.stopLoading()
+                      WebStorage.getInstance().deleteAllData()
+                      w.clearCache(true)
+                      w.clearHistory()
+                      w.clearFormData()
+                      CookieManager.getInstance().removeAllCookies { _ -> then() }
+                  } catch (e: Exception) {
+                      then()
+                  }
               }
 
               private fun nextMethod() {
@@ -847,7 +887,7 @@ jobs:
                   runFail++
                   save(this)
                   setStatus("(${idx + 1}/${queue.size}) NOT DONE, skipped", true)
-                  h.postDelayed({ if (running) next() }, 600)
+                  h.postDelayed({ if (running) next() }, 150)
               }
 
               private fun captured(url: String, cd: String?, mime: String?) {
@@ -866,7 +906,7 @@ jobs:
                   runOk++
                   save(this)
                   setStatus("(${idx + 1}/${queue.size}) captured: $name", true)
-                  h.postDelayed({ if (running) next() }, 800)
+                  h.postDelayed({ if (running) next() }, 150)
               }
 
               // ---------- finish ----------
