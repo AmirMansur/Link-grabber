@@ -1,1 +1,495 @@
+name: Build APK
 
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create project files
+        run: |
+          mkdir -p src/main/java/com/linkgrabber
+          cat > settings.gradle <<'EOF_FILE'
+          rootProject.name = 'LinkGrabber'
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.2.2'
+                  classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22'
+              }
+          }
+
+          apply plugin: 'com.android.application'
+          apply plugin: 'org.jetbrains.kotlin.android'
+
+          repositories {
+              google()
+              mavenCentral()
+          }
+
+          android {
+              namespace 'com.linkgrabber'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.linkgrabber'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          EOF_FILE
+          cat > src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Link Grabber"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF_FILE
+                    cat > src/main/java/com/linkgrabber/MainActivity.kt <<'EOF_FILE'
+          package com.linkgrabber
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.Message
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.webkit.CookieManager
+          import android.webkit.JsPromptResult
+          import android.webkit.JsResult
+          import android.webkit.URLUtil
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.ByteArrayInputStream
+
+          class MainActivity : Activity() {
+
+              // Hosts that are blocked inside the built-in browser (ads, popups, redirect networks).
+              private val adHosts = listOf(
+                  "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+                  "popads.net", "popcash.net", "propellerads.com", "exoclick.com", "juicyads.com",
+                  "trafficjunky.com", "adsterra.com", "highperformanceformat.com", "effectivegatecpm.com",
+                  "profitablegatecpm.com", "onclickads.net", "clickadu.com", "hilltopads.net", "adcash.com",
+                  "a-ads.com", "mgid.com", "taboola.com", "outbrain.com", "revcontent.com", "monetag.com",
+                  "admaven.com", "ad-maven.com", "adnxs.com", "pubmatic.com", "rubiconproject.com",
+                  "criteo.com", "amazon-adsystem.com", "popunder.net", "tsyndicate.com", "realsrv.com",
+                  "bidgear.com", "yllix.com", "ero-advertising.com", "trafficstars.com", "onclkds.com",
+                  "richpush.co", "pushails.com", "adskeeper.com", "clickaine.com", "acscdn.com",
+                  "adspyglass.com", "ad.gt", "popcdn.net", "syndication.realsrv.com"
+              )
+
+              private val clickJs = """
+          (function(){
+            try{
+              var now=Date.now();
+              var els=document.querySelectorAll('a,button,[role="button"],input[type="button"],input[type="submit"]');
+              var best=null,bestRank=9;
+              for(var i=0;i<els.length;i++){
+                var e=els[i];
+                var t=((e.innerText||e.value||e.textContent||'')+'').replace(/\s+/g,' ').trim().toLowerCase();
+                if(!t||t.length>40) continue;
+                var rank=t.indexOf('index download')>=0?0:(t.indexOf('direct download')>=0?1:9);
+                if(rank==9) continue;
+                if(e.disabled||e.getAttribute('aria-disabled')==='true') continue;
+                var r=e.getBoundingClientRect();
+                if(r.width<5||r.height<5) continue;
+                var last=parseInt(e.getAttribute('data-lg')||'0');
+                if(now-last<7000) continue;
+                if(rank<bestRank){best=e;bestRank=rank;}
+              }
+              if(best){
+                best.setAttribute('data-lg',String(now));
+                best.click();
+                return 'clicked: '+((best.innerText||best.value||'')+'').trim();
+              }
+              return 'waiting for button...';
+            }catch(x){return 'js error';}
+          })();
+          """
+
+              private lateinit var input: EditText
+              private lateinit var status: TextView
+              private lateinit var results: TextView
+              private lateinit var web: WebView
+              private lateinit var startBtn: Button
+
+              private val h = Handler(Looper.getMainLooper())
+              private val queue = ArrayList<String>()
+              private val okList = ArrayList<String>()   // "name<TAB>url"
+              private val failList = ArrayList<String>() // original links that failed
+              private val prefs by lazy { getSharedPreferences("lg", MODE_PRIVATE) }
+
+              private var idx = -1
+              private var running = false
+              private var attempt = 0
+              private var startedAt = 0L
+              private var done = false
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running || done) return
+                      if (System.currentTimeMillis() - startedAt > 120000) {
+                          fail()
+                          return
+                      }
+                      web.evaluateJavascript(clickJs) { r ->
+                          if (running && !done) {
+                              status.text = "(${idx + 1}/${queue.size}) " + (r ?: "").trim('"')
+                          }
+                      }
+                      h.postDelayed(this, 1500)
+                  }
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(16, 16, 16, 16)
+                  }
+                  val mp = LinearLayout.LayoutParams.MATCH_PARENT
+                  val wc = LinearLayout.LayoutParams.WRAP_CONTENT
+
+                  input = EditText(this).apply {
+                      hint = "Paste links here (any text with links works)"
+                      minLines = 3
+                      maxLines = 4
+                      textSize = 13f
+                      gravity = Gravity.TOP
+                  }
+                  root.addView(input, LinearLayout.LayoutParams(mp, wc))
+
+                  startBtn = btn("Start") { start() }
+                  root.addView(row(btn("Load .txt") { pickFiles() }, startBtn, btn("Stop") { if (running) stop("Stopped") }))
+
+                  status = TextView(this).apply { textSize = 13f; text = "Ready"; setPadding(4, 8, 4, 8) }
+                  root.addView(status, LinearLayout.LayoutParams(mp, wc))
+
+                  root.addView(row(
+                      btn("Copy links") { copy(okList.joinToString("\n") { it.substringAfter("\t") }, "Links") },
+                      btn("Copy failed") { copy(failList.joinToString("\n"), "Failed links") },
+                      btn("Clear") { clearAll() }
+                  ))
+
+                  results = TextView(this).apply { textSize = 12f; setTextIsSelectable(true); setPadding(4, 8, 4, 8) }
+                  val sv = ScrollView(this).apply { addView(results) }
+                  root.addView(sv, LinearLayout.LayoutParams(mp, 0, 1f))
+
+                  web = WebView(this)
+                  root.addView(web, LinearLayout.LayoutParams(mp, 0, 1f))
+
+                  setContentView(root)
+                  setupWeb()
+
+                  okList.addAll((prefs.getString("ok", "") ?: "").split("\n").filter { it.isNotBlank() })
+                  failList.addAll((prefs.getString("fail", "") ?: "").split("\n").filter { it.isNotBlank() })
+                  render()
+              }
+
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t
+                  isAllCaps = false
+                  textSize = 12f
+                  setOnClickListener { f() }
+              }
+
+              private fun row(vararg b: Button) = LinearLayout(this).apply {
+                  orientation = LinearLayout.HORIZONTAL
+                  b.forEach { addView(it, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)) }
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun setupWeb() {
+                  val s = web.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.javaScriptCanOpenWindowsAutomatically = false
+                  s.setSupportMultipleWindows(true)
+                  s.mediaPlaybackRequiresUserGesture = true
+                  s.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                  CookieManager.getInstance().setAcceptCookie(true)
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+
+                  web.webChromeClient = object : WebChromeClient() {
+                      // Popups / new tabs are never opened.
+                      override fun onCreateWindow(
+                          view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
+                      ): Boolean = false
+
+                      override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                          result?.cancel(); return true
+                      }
+
+                      override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                          result?.cancel(); return true
+                      }
+
+                      override fun onJsPrompt(
+                          view: WebView?, url: String?, message: String?, defaultValue: String?, result: JsPromptResult?
+                      ): Boolean {
+                          result?.cancel(); return true
+                      }
+                  }
+
+                  web.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                          val host = request?.url?.host ?: return null
+                          if (blocked(host)) {
+                              return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                          }
+                          return null
+                      }
+
+                      override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                          val u = request?.url ?: return true
+                          val sc = u.scheme ?: ""
+                          if (sc != "http" && sc != "https") return true // blocks intent://, market:// etc.
+                          if (blocked(u.host ?: "")) return true
+                          return false
+                      }
+                  }
+
+                  web.setDownloadListener { url, _, cd, mime, _ ->
+                      h.post { captured(url, cd, mime) }
+                  }
+              }
+
+              private fun blocked(host: String): Boolean = adHosts.any { host == it || host.endsWith(".$it") }
+
+              // ---------- queue ----------
+
+              private fun start() {
+                  if (running) return
+                  val links = Regex("https?://[^\\s\"'<>]+").findAll(input.text).map { it.value }.distinct().toList()
+                  if (links.isEmpty()) {
+                      toast("No links found")
+                      return
+                  }
+                  queue.clear()
+                  queue.addAll(links)
+                  idx = -1
+                  running = true
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  startBtn.isEnabled = false
+                  next()
+              }
+
+              private fun stop(msg: String) {
+                  running = false
+                  done = true
+                  h.removeCallbacksAndMessages(null)
+                  web.stopLoading()
+                  web.loadUrl("about:blank")
+                  window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  startBtn.isEnabled = true
+                  status.text = msg
+              }
+
+              private fun next() {
+                  idx++
+                  if (idx >= queue.size) {
+                      stop("Finished: ${okList.size} captured, ${failList.size} failed")
+                      return
+                  }
+                  attempt = 0
+                  load()
+              }
+
+              private fun load() {
+                  attempt++
+                  done = false
+                  startedAt = System.currentTimeMillis()
+                  status.text = "(${idx + 1}/${queue.size}) loading, try $attempt..."
+                  web.loadUrl(queue[idx])
+                  h.removeCallbacks(tick)
+                  h.postDelayed(tick, 2500)
+              }
+
+              private fun fail() {
+                  if (attempt < 2) {
+                      load()
+                      return
+                  }
+                  done = true
+                  h.removeCallbacks(tick)
+                  failList.add(queue[idx])
+                  render()
+                  h.postDelayed({ if (running) next() }, 500)
+              }
+
+              private fun captured(url: String, cd: String?, mime: String?) {
+                  if (!running || done) return
+                  val name = URLUtil.guessFileName(url, cd, mime)
+                  val low = name.lowercase()
+                  // Ignore blob/data links and ad-style downloads.
+                  if (url.startsWith("blob:") || url.startsWith("data:") ||
+                      low.endsWith(".apk") || low.endsWith(".exe") || low.endsWith(".msi")
+                  ) return
+                  done = true
+                  h.removeCallbacks(tick)
+                  web.stopLoading()
+                  web.loadUrl("about:blank")
+                  okList.add(name + "\t" + url)
+                  render()
+                  status.text = "(${idx + 1}/${queue.size}) captured: $name"
+                  h.postDelayed({ if (running) next() }, 800)
+              }
+
+              // ---------- results ----------
+
+              private fun render() {
+                  val sb = StringBuilder()
+                  okList.forEachIndexed { i, e ->
+                      val p = e.split("\t")
+                      sb.append("${i + 1}. ${p[0]}\n${p.getOrElse(1) { "" }}\n\n")
+                  }
+                  if (failList.isNotEmpty()) {
+                      sb.append("FAILED (${failList.size}):\n")
+                      failList.forEach { sb.append(it).append("\n") }
+                  }
+                  results.text = if (sb.isEmpty()) "Captured links will appear here." else sb.toString()
+                  prefs.edit()
+                      .putString("ok", okList.joinToString("\n"))
+                      .putString("fail", failList.joinToString("\n"))
+                      .apply()
+              }
+
+              private fun clearAll() {
+                  if (running) {
+                      toast("Stop first")
+                      return
+                  }
+                  okList.clear()
+                  failList.clear()
+                  render()
+              }
+
+              private fun copy(text: String, what: String) {
+                  if (text.isBlank()) {
+                      toast("Nothing to copy")
+                      return
+                  }
+                  (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
+                      .setPrimaryClip(ClipData.newPlainText("links", text))
+                  toast("$what copied")
+              }
+
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+
+              // ---------- load .txt ----------
+
+              private fun pickFiles() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "text/*"
+                      putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  }
+                  startActivityForResult(i, 1)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 1 || resultCode != RESULT_OK || data == null) return
+                  val uris = ArrayList<android.net.Uri>()
+                  data.data?.let { uris.add(it) }
+                  data.clipData?.let { c -> for (k in 0 until c.itemCount) uris.add(c.getItemAt(k).uri) }
+                  val sb = StringBuilder(input.text)
+                  for (u in uris) {
+                      try {
+                          val t = contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() } ?: ""
+                          if (sb.isNotEmpty()) sb.append("\n")
+                          sb.append(t)
+                      } catch (e: Exception) {
+                          toast("Could not read a file")
+                      }
+                  }
+                  input.setText(sb.toString())
+              }
+
+              override fun onDestroy() {
+                  h.removeCallbacksAndMessages(null)
+                  web.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LinkGrabber-APK
+          path: build/outputs/apk/debug/*.apk
+          
