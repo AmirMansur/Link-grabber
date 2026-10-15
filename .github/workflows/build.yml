@@ -73,6 +73,11 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
 
               <application
                   android:allowBackup="false"
@@ -91,130 +96,66 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <service
+                      android:name=".GrabberService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+
               </application>
           </manifest>
           EOF_FILE
-                    cat > src/main/java/com/linkgrabber/MainActivity.kt <<'EOF_FILE'
+          cat > src/main/java/com/linkgrabber/MainActivity.kt <<'EOF_FILE'
           package com.linkgrabber
 
-          import android.annotation.SuppressLint
+          import android.Manifest
           import android.app.Activity
           import android.content.ClipData
           import android.content.ClipboardManager
           import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
-          import android.os.Message
+          import android.provider.Settings
+          import android.text.InputType
           import android.view.Gravity
-          import android.view.WindowManager
-          import android.webkit.CookieManager
-          import android.webkit.JsPromptResult
-          import android.webkit.JsResult
-          import android.webkit.URLUtil
-          import android.webkit.WebChromeClient
-          import android.webkit.WebResourceRequest
-          import android.webkit.WebResourceResponse
-          import android.webkit.WebSettings
-          import android.webkit.WebView
-          import android.webkit.WebViewClient
           import android.widget.Button
           import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
           import android.widget.Toast
-          import java.io.ByteArrayInputStream
 
           class MainActivity : Activity() {
 
-              // Hosts that are blocked inside the built-in browser (ads, popups, redirect networks).
-              private val adHosts = listOf(
-                  "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
-                  "popads.net", "popcash.net", "propellerads.com", "exoclick.com", "juicyads.com",
-                  "trafficjunky.com", "adsterra.com", "highperformanceformat.com", "effectivegatecpm.com",
-                  "profitablegatecpm.com", "onclickads.net", "clickadu.com", "hilltopads.net", "adcash.com",
-                  "a-ads.com", "mgid.com", "taboola.com", "outbrain.com", "revcontent.com", "monetag.com",
-                  "admaven.com", "ad-maven.com", "adnxs.com", "pubmatic.com", "rubiconproject.com",
-                  "criteo.com", "amazon-adsystem.com", "popunder.net", "tsyndicate.com", "realsrv.com",
-                  "bidgear.com", "yllix.com", "ero-advertising.com", "trafficstars.com", "onclkds.com",
-                  "richpush.co", "pushails.com", "adskeeper.com", "clickaine.com", "acscdn.com",
-                  "adspyglass.com", "ad.gt", "popcdn.net", "syndication.realsrv.com"
-              )
-
-              private val clickJs = """
-          (function(){
-            try{
-              var now=Date.now();
-              var els=document.querySelectorAll('a,button,[role="button"],input[type="button"],input[type="submit"]');
-              var best=null,bestRank=9;
-              for(var i=0;i<els.length;i++){
-                var e=els[i];
-                var t=((e.innerText||e.value||e.textContent||'')+'').replace(/\s+/g,' ').trim().toLowerCase();
-                if(!t||t.length>40) continue;
-                var rank=t.indexOf('index download')>=0?0:(t.indexOf('direct download')>=0?1:9);
-                if(rank==9) continue;
-                if(e.disabled||e.getAttribute('aria-disabled')==='true') continue;
-                var r=e.getBoundingClientRect();
-                if(r.width<5||r.height<5) continue;
-                var last=parseInt(e.getAttribute('data-lg')||'0');
-                if(now-last<7000) continue;
-                if(rank<bestRank){best=e;bestRank=rank;}
-              }
-              if(best){
-                best.setAttribute('data-lg',String(now));
-                best.click();
-                return 'clicked: '+((best.innerText||best.value||'')+'').trim();
-              }
-              return 'waiting for button...';
-            }catch(x){return 'js error';}
-          })();
-          """
-
               private lateinit var input: EditText
+              private lateinit var secsEt: EditText
               private lateinit var status: TextView
               private lateinit var results: TextView
-              private lateinit var web: WebView
               private lateinit var startBtn: Button
 
               private val h = Handler(Looper.getMainLooper())
-              private val queue = ArrayList<String>()
-              private val okList = ArrayList<String>()   // "name<TAB>url"
-              private val failList = ArrayList<String>() // original links that failed
-              private val prefs by lazy { getSharedPreferences("lg", MODE_PRIVATE) }
-
-              private var idx = -1
-              private var running = false
-              private var attempt = 0
-              private var startedAt = 0L
-              private var done = false
-
-              private val tick = object : Runnable {
+              private var lastVer = -1
+              private val poll = object : Runnable {
                   override fun run() {
-                      if (!running || done) return
-                      if (System.currentTimeMillis() - startedAt > 120000) {
-                          fail()
-                          return
-                      }
-                      web.evaluateJavascript(clickJs) { r ->
-                          if (running && !done) {
-                              status.text = "(${idx + 1}/${queue.size}) " + (r ?: "").trim('"')
-                          }
-                      }
-                      h.postDelayed(this, 1500)
+                      refresh()
+                      h.postDelayed(this, 700)
                   }
               }
 
-              @SuppressLint("SetJavaScriptEnabled")
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  GrabberService.load(this)
+
+                  val mp = LinearLayout.LayoutParams.MATCH_PARENT
+                  val wc = LinearLayout.LayoutParams.WRAP_CONTENT
 
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setPadding(16, 16, 16, 16)
                   }
-                  val mp = LinearLayout.LayoutParams.MATCH_PARENT
-                  val wc = LinearLayout.LayoutParams.WRAP_CONTENT
 
                   input = EditText(this).apply {
                       hint = "Paste links here (any text with links works)"
@@ -226,30 +167,57 @@ jobs:
                   root.addView(input, LinearLayout.LayoutParams(mp, wc))
 
                   startBtn = btn("Start") { start() }
-                  root.addView(row(btn("Load .txt") { pickFiles() }, startBtn, btn("Stop") { if (running) stop("Stopped") }))
+                  root.addView(row(btn("Load .txt") { pickFiles() }, startBtn, btn("Stop") { stopRun() }))
 
-                  status = TextView(this).apply { textSize = 13f; text = "Ready"; setPadding(4, 8, 4, 8) }
+                  val secRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  secRow.addView(TextView(this).apply {
+                      text = "Seconds per method: "
+                      textSize = 13f
+                  })
+                  secsEt = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      setText("12")
+                      textSize = 13f
+                      minEms = 3
+                  }
+                  secRow.addView(secsEt)
+                  root.addView(secRow, LinearLayout.LayoutParams(mp, wc))
+                  status = TextView(this).apply {
+                      textSize = 13f
+                      text = "Ready"
+                      setPadding(4, 8, 4, 8)
+                  }
                   root.addView(status, LinearLayout.LayoutParams(mp, wc))
 
                   root.addView(row(
-                      btn("Copy links") { copy(okList.joinToString("\n") { it.substringAfter("\t") }, "Links") },
-                      btn("Copy failed") { copy(failList.joinToString("\n"), "Failed links") },
+                      btn("Copy links") { copy(GrabberService.ok.joinToString("\n") { it.substringAfter("\t") }, "Links") },
+                      btn("Copy not done") { copy(GrabberService.notDone.joinToString("\n"), "Not done links") },
                       btn("Clear") { clearAll() }
                   ))
 
-                  results = TextView(this).apply { textSize = 12f; setTextIsSelectable(true); setPadding(4, 8, 4, 8) }
+                  results = TextView(this).apply {
+                      textSize = 12f
+                      setTextIsSelectable(true)
+                      setPadding(4, 8, 4, 8)
+                  }
                   val sv = ScrollView(this).apply { addView(results) }
                   root.addView(sv, LinearLayout.LayoutParams(mp, 0, 1f))
 
-                  web = WebView(this)
-                  root.addView(web, LinearLayout.LayoutParams(mp, 0, 1f))
-
                   setContentView(root)
-                  setupWeb()
+              }
 
-                  okList.addAll((prefs.getString("ok", "") ?: "").split("\n").filter { it.isNotBlank() })
-                  failList.addAll((prefs.getString("fail", "") ?: "").split("\n").filter { it.isNotBlank() })
-                  render()
+              override fun onResume() {
+                  super.onResume()
+                  lastVer = -1
+                  h.post(poll)
+              }
+
+              override fun onPause() {
+                  h.removeCallbacks(poll)
+                  super.onPause()
               }
 
               private fun btn(t: String, f: () -> Unit) = Button(this).apply {
@@ -264,9 +232,406 @@ jobs:
                   b.forEach { addView(it, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)) }
               }
 
+              private fun refresh() {
+                  if (GrabberService.version == lastVer) return
+                  lastVer = GrabberService.version
+                  status.text = GrabberService.statusText
+                  startBtn.isEnabled = !GrabberService.running
+
+                  val sb = StringBuilder()
+                  GrabberService.ok.forEachIndexed { i, e ->
+                      val p = e.split("\t")
+                      sb.append("${i + 1}. ${p[0]}\n${p.getOrElse(1) { "" }}\n\n")
+                  }
+                  if (GrabberService.notDone.isNotEmpty()) {
+                      sb.append("NOT DONE (${GrabberService.notDone.size}):\n")
+                      GrabberService.notDone.forEach { sb.append(it).append("\n") }
+                  }
+                  val s = if (sb.isEmpty()) "Captured links will appear here." else sb.toString()
+                  if (results.text.toString() != s) results.text = s
+              }
+
+              private fun start() {
+                  if (GrabberService.running) {
+                      toast("Already running")
+                      return
+                  }
+                  val links = Regex("https?://[^\\s\"'<>]+").findAll(input.text).map { it.value }.distinct().toList()
+                  if (links.isEmpty()) {
+                      toast("No links found")
+                      return
+                  }
+                  if (!Settings.canDrawOverlays(this)) {
+                      toast("Allow 'Display over other apps' for this app, then tap Start again")
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
+                  }
+                  val secs = (secsEt.text.toString().toIntOrNull() ?: 12).coerceIn(5, 120)
+                  val i = Intent(this, GrabberService::class.java)
+                      .setAction(GrabberService.ACTION_START)
+                      .putStringArrayListExtra(GrabberService.EXTRA_LINKS, ArrayList(links))
+                      .putExtra(GrabberService.EXTRA_SECS, secs)
+                  startForegroundService(i)
+              }
+
+              private fun stopRun() {
+                  if (!GrabberService.running) {
+                      toast("Not running")
+                      return
+                  }
+                  startService(Intent(this, GrabberService::class.java).setAction(GrabberService.ACTION_STOP))
+              }
+
+              private fun clearAll() {
+                  if (GrabberService.running) {
+                      toast("Stop first")
+                      return
+                  }
+                  GrabberService.clear(this)
+              }
+
+              private fun copy(text: String, what: String) {
+                  if (text.isBlank()) {
+                      toast("Nothing to copy")
+                      return
+                  }
+                  (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
+                      .setPrimaryClip(ClipData.newPlainText("links", text))
+                  toast("$what copied")
+              }
+
+              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+
+              private fun pickFiles() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "text/*"
+                      putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  }
+                  startActivityForResult(i, 1)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 1 || resultCode != RESULT_OK || data == null) return
+                  val uris = ArrayList<Uri>()
+                  data.data?.let { uris.add(it) }
+                  data.clipData?.let { c -> for (k in 0 until c.itemCount) uris.add(c.getItemAt(k).uri) }
+                  val sb = StringBuilder(input.text)
+                  for (u in uris) {
+                      try {
+                          val t = contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() } ?: ""
+                          if (sb.isNotEmpty()) sb.append("\n")
+                          sb.append(t)
+                      } catch (e: Exception) {
+                          toast("Could not read a file")
+                      }
+                  }
+                  input.setText(sb.toString())
+              }
+          }
+          EOF_FILE
+          cat > src/main/java/com/linkgrabber/GrabberService.kt <<'EOF_FILE'
+          package com.linkgrabber
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.Message
+          import android.os.PowerManager
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.webkit.CookieManager
+          import android.webkit.JsPromptResult
+          import android.webkit.JsResult
+          import android.webkit.URLUtil
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.io.ByteArrayInputStream
+          import kotlin.math.abs
+
+          class GrabberService : Service() {
+
+              companion object {
+                  const val ACTION_START = "com.linkgrabber.START"
+                  const val ACTION_STOP = "com.linkgrabber.STOP"
+                  const val EXTRA_LINKS = "links"
+                  const val EXTRA_SECS = "secs"
+                  private const val CHANNEL = "lg_run"
+                  private const val NOTIF_ID = 1
+
+                  @Volatile var running = false
+                  @Volatile var statusText = "Ready"
+                  @Volatile var version = 0
+                  val ok = ArrayList<String>()       // "name<TAB>url"
+                  val notDone = ArrayList<String>()  // original links that could not be captured
+                  private var loaded = false
+
+                  fun load(ctx: Context) {
+                      if (loaded) return
+                      loaded = true
+                      val p = ctx.getSharedPreferences("lg", Context.MODE_PRIVATE)
+                      ok.addAll((p.getString("ok", "") ?: "").split("\n").filter { it.isNotBlank() })
+                      notDone.addAll((p.getString("fail", "") ?: "").split("\n").filter { it.isNotBlank() })
+                  }
+
+                  fun save(ctx: Context) {
+                      ctx.getSharedPreferences("lg", Context.MODE_PRIVATE).edit()
+                          .putString("ok", ok.joinToString("\n"))
+                          .putString("fail", notDone.joinToString("\n"))
+                          .apply()
+                  }
+
+                  fun clear(ctx: Context) {
+                      ok.clear()
+                      notDone.clear()
+                      save(ctx)
+                      version++
+                  }
+              }
+
+              // Hosts that are blocked inside the built-in browser (ads, popups, redirect networks).
+              private val adHosts = listOf(
+                  "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+                  "popads.net", "popcash.net", "propellerads.com", "exoclick.com", "juicyads.com",
+                  "trafficjunky.com", "adsterra.com", "highperformanceformat.com", "effectivegatecpm.com",
+                  "profitablegatecpm.com", "onclickads.net", "clickadu.com", "hilltopads.net", "adcash.com",
+                  "a-ads.com", "mgid.com", "taboola.com", "outbrain.com", "revcontent.com", "monetag.com",
+                  "admaven.com", "ad-maven.com", "adnxs.com", "pubmatic.com", "rubiconproject.com",
+                  "criteo.com", "amazon-adsystem.com", "popunder.net", "tsyndicate.com", "realsrv.com",
+                  "bidgear.com", "yllix.com", "ero-advertising.com", "trafficstars.com", "onclkds.com",
+                  "richpush.co", "pushails.com", "adskeeper.com", "clickaine.com", "acscdn.com",
+                  "adspyglass.com", "ad.gt", "popcdn.net"
+              )
+
+              // MODE is "direct" or "instant". The first group of buttons found decides what is clicked.
+              private val clickTemplate = """
+          (function(MODE){
+            try{
+              var now=Date.now();
+              var els=document.querySelectorAll('a,button,[role="button"],input[type="button"],input[type="submit"]');
+              var c={instant:[],index:[],direct:[]};
+              for(var i=0;i<els.length;i++){
+                var e=els[i];
+                var t=((e.innerText||e.value||e.textContent||'')+'').replace(/\s+/g,' ').trim().toLowerCase();
+                if(!t||t.length>40) continue;
+                var k=null;
+                if(t.indexOf('instant download')>=0) k='instant';
+                else if(t.indexOf('index download')>=0) k='index';
+                else if(t.indexOf('direct download')>=0) k='direct';
+                if(!k) continue;
+                if(e.disabled||e.getAttribute('aria-disabled')==='true') continue;
+                var r=e.getBoundingClientRect();
+                if(r.width<5||r.height<5) continue;
+                c[k].push(e);
+              }
+              var order=['index','direct'];
+              if(MODE==='instant'&&c.instant.length) order=['instant'];
+              for(var j=0;j<order.length;j++){
+                var list=c[order[j]];
+                if(!list.length) continue;
+                var b=list[0];
+                var last=parseInt(b.getAttribute('data-lg')||'0');
+                if(now-last<7000) return 'waiting...';
+                b.setAttribute('data-lg',String(now));
+                b.click();
+                return 'clicked '+order[j];
+              }
+              return 'waiting for button...';
+            }catch(x){return 'js error';}
+          })('__MODE__');
+          """
+
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private lateinit var panelParams: WindowManager.LayoutParams
+              private lateinit var bubbleParams: WindowManager.LayoutParams
+              private var web: WebView? = null
+              private var panel: LinearLayout? = null
+              private var titleTv: TextView? = null
+              private var bubble: TextView? = null
+              private var wake: PowerManager.WakeLock? = null
+
+              private val queue = ArrayList<String>()
+              private val methods = listOf("direct", "instant", "direct")
+              private var idx = -1
+              private var methodIdx = 0
+              private var secs = 12
+              private var done = false
+              private var startedAt = 0L
+              private var runOk = 0
+              private var runFail = 0
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running || done) return
+                      if (System.currentTimeMillis() - startedAt > secs * 1000L) {
+                          nextMethod()
+                          return
+                      }
+                      val js = clickTemplate.replace("__MODE__", methods[methodIdx])
+                      web?.evaluateJavascript(js) { r ->
+                          if (running && !done) {
+                              setStatus("(${idx + 1}/${queue.size}) ${label()}: " + (r ?: "").trim('"'))
+                          }
+                      }
+                      h.postDelayed(this, 1000)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  load(this)
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> {
+                          finish("Stopped")
+                      }
+                      ACTION_START -> {
+                          if (running) return START_NOT_STICKY
+                          startFg("Starting...")
+                          val links = intent?.getStringArrayListExtra(EXTRA_LINKS) ?: ArrayList()
+                          secs = intent?.getIntExtra(EXTRA_SECS, 12) ?: 12
+                          if (links.isEmpty()) {
+                              finish("No links")
+                              return START_NOT_STICKY
+                          }
+                          queue.clear()
+                          queue.addAll(links)
+                          idx = -1
+                          runOk = 0
+                          runFail = 0
+                          running = true
+                          try {
+                              setupOverlay()
+                          } catch (e: Exception) {
+                              finish("Could not show floating window. Allow Display over other apps.")
+                              return START_NOT_STICKY
+                          }
+                          val pm = getSystemService(POWER_SERVICE) as PowerManager
+                          wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "linkgrabber:run")
+                              .apply { acquire(6 * 60 * 60 * 1000L) }
+                          next()
+                      }
+                      else -> stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              // ---------- notification ----------
+
+              private fun buildNotif(text: String): Notification {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel(CHANNEL, "Link Grabber", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val pi = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  @Suppress("DEPRECATION")
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
+                  return b.setContentTitle("Link Grabber")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.stat_sys_download)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              private fun startFg(text: String) {
+                  val n = buildNotif(text)
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  } else {
+                      startForeground(NOTIF_ID, n)
+                  }
+              }
+
+              private fun setStatus(s: String, notifyToo: Boolean = false) {
+                  statusText = s
+                  version++
+                  titleTv?.text = s
+                  if (idx >= 0) bubble?.text = "${idx + 1}/${queue.size}"
+                  if (notifyToo) {
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIF_ID, buildNotif(s))
+                  }
+              }
+
+              // ---------- overlay (floating preview window + bubble) ----------
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun chip(t: String, f: () -> Unit) = TextView(this).apply {
+                  text = t
+                  setTextColor(Color.WHITE)
+                  textSize = 12f
+                  setPadding(dp(8), dp(6), dp(8), dp(6))
+                  setBackgroundColor(0xFF374151.toInt())
+                  setOnClickListener { f() }
+              }
+
+              @Suppress("DEPRECATION")
               @SuppressLint("SetJavaScriptEnabled")
-              private fun setupWeb() {
-                  val s = web.settings
+              private fun setupOverlay() {
+                  val type = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else WindowManager.LayoutParams.TYPE_PHONE
+                  val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                  val wrap = WindowManager.LayoutParams.WRAP_CONTENT
+
+                  panelParams = WindowManager.LayoutParams(dp(300), wrap, type, flags, PixelFormat.TRANSLUCENT).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = dp(16)
+                      y = dp(90)
+                  }
+                  bubbleParams = WindowManager.LayoutParams(wrap, wrap, type, flags, PixelFormat.TRANSLUCENT).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = dp(16)
+                      y = dp(90)
+                  }
+
+                  // Browser
+                  val w = WebView(this)
+                  web = w
+                  val s = w.settings
                   s.javaScriptEnabled = true
                   s.domStorageEnabled = true
                   s.javaScriptCanOpenWindowsAutomatically = false
@@ -274,9 +639,9 @@ jobs:
                   s.mediaPlaybackRequiresUserGesture = true
                   s.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                   CookieManager.getInstance().setAcceptCookie(true)
-                  CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
 
-                  web.webChromeClient = object : WebChromeClient() {
+                  w.webChromeClient = object : WebChromeClient() {
                       // Popups / new tabs are never opened.
                       override fun onCreateWindow(
                           view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
@@ -297,7 +662,7 @@ jobs:
                       }
                   }
 
-                  web.webViewClient = object : WebViewClient() {
+                  w.webViewClient = object : WebViewClient() {
                       override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                           val host = request?.url?.host ?: return null
                           if (blocked(host)) {
@@ -309,78 +674,180 @@ jobs:
                       override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                           val u = request?.url ?: return true
                           val sc = u.scheme ?: ""
-                          if (sc != "http" && sc != "https") return true // blocks intent://, market:// etc.
+                          if (sc != "http" && sc != "https") return true
                           if (blocked(u.host ?: "")) return true
                           return false
                       }
                   }
 
-                  web.setDownloadListener { url, _, cd, mime, _ ->
+                  w.setDownloadListener { url, _, cd, mime, _ ->
                       h.post { captured(url, cd, mime) }
                   }
+
+                  // Floating window = header (progress + buttons) + browser preview
+                  val p = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(0xFF111827.toInt())
+                  }
+                  val header = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setBackgroundColor(0xFF1F2937.toInt())
+                      setPadding(dp(8), dp(4), dp(4), dp(4))
+                  }
+                  val t = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 11f
+                      maxLines = 2
+                      text = "Starting..."
+                  }
+                  titleTv = t
+                  header.addView(t, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  header.addView(chip("Stop") { finish("Stopped") }, chipLp())
+                  header.addView(chip("App") { openApp() }, chipLp())
+                  header.addView(chip("Hide") { collapse() }, chipLp())
+                  p.addView(header, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, wrap))
+                  p.addView(w, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(340)))
+                  panel = p
+                  makeDraggable(t, panelParams, p, null)
+
+                  // Bubble (shown when the window is hidden)
+                  val b = TextView(this).apply {
+                      setWidth(dp(56))
+                      setHeight(dp(56))
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.WHITE)
+                      textSize = 12f
+                      text = "..."
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(0xFF2563EB.toInt())
+                      }
+                  }
+                  bubble = b
+                  makeDraggable(b, bubbleParams, b) { expand() }
+
+                  wm.addView(p, panelParams)
+              }
+
+              private fun chipLp() = LinearLayout.LayoutParams(
+                  LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+              ).apply { leftMargin = dp(4) }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun makeDraggable(handle: View, params: WindowManager.LayoutParams, target: View, onTap: (() -> Unit)?) {
+                  var sx = 0
+                  var sy = 0
+                  var tx = 0f
+                  var ty = 0f
+                  var moved = false
+                  handle.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              sx = params.x
+                              sy = params.y
+                              tx = e.rawX
+                              ty = e.rawY
+                              moved = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - tx).toInt()
+                              val dy = (e.rawY - ty).toInt()
+                              if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                              params.x = sx + dx
+                              params.y = sy + dy
+                              try {
+                                  wm.updateViewLayout(target, params)
+                              } catch (_: Exception) {
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!moved) onTap?.invoke()
+                          }
+                      }
+                      true
+                  }
+              }
+
+              // Hide = the window becomes invisible and untouchable (the browser keeps running), a bubble appears.
+              private fun collapse() {
+                  val p = panel ?: return
+                  val b = bubble ?: return
+                  panelParams.alpha = 0.02f
+                  panelParams.flags = panelParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  bubbleParams.x = panelParams.x
+                  bubbleParams.y = panelParams.y
+                  try {
+                      wm.updateViewLayout(p, panelParams)
+                      if (!b.isAttachedToWindow) wm.addView(b, bubbleParams)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun expand() {
+                  val p = panel ?: return
+                  val b = bubble ?: return
+                  panelParams.alpha = 1f
+                  panelParams.flags = panelParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                  panelParams.x = bubbleParams.x
+                  panelParams.y = bubbleParams.y
+                  try {
+                      if (b.isAttachedToWindow) wm.removeView(b)
+                      wm.updateViewLayout(p, panelParams)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun openApp() {
+                  startActivity(
+                      Intent(this, MainActivity::class.java)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                  )
               }
 
               private fun blocked(host: String): Boolean = adHosts.any { host == it || host.endsWith(".$it") }
 
-              // ---------- queue ----------
+              // ---------- queue and fallback: Direct -> Instant -> Direct -> not done ----------
 
-              private fun start() {
-                  if (running) return
-                  val links = Regex("https?://[^\\s\"'<>]+").findAll(input.text).map { it.value }.distinct().toList()
-                  if (links.isEmpty()) {
-                      toast("No links found")
-                      return
-                  }
-                  queue.clear()
-                  queue.addAll(links)
-                  idx = -1
-                  running = true
-                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  startBtn.isEnabled = false
-                  next()
-              }
-
-              private fun stop(msg: String) {
-                  running = false
-                  done = true
-                  h.removeCallbacksAndMessages(null)
-                  web.stopLoading()
-                  web.loadUrl("about:blank")
-                  window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  startBtn.isEnabled = true
-                  status.text = msg
-              }
+              private fun label() = if (methods[methodIdx] == "instant") "Instant" else "Direct"
 
               private fun next() {
                   idx++
                   if (idx >= queue.size) {
-                      stop("Finished: ${okList.size} captured, ${failList.size} failed")
+                      finish("Finished: $runOk captured, $runFail not done")
                       return
                   }
-                  attempt = 0
-                  load()
+                  methodIdx = 0
+                  loadCurrent()
               }
 
-              private fun load() {
-                  attempt++
+              private fun loadCurrent() {
                   done = false
                   startedAt = System.currentTimeMillis()
-                  status.text = "(${idx + 1}/${queue.size}) loading, try $attempt..."
-                  web.loadUrl(queue[idx])
+                  setStatus("(${idx + 1}/${queue.size}) ${label()} download: loading...", true)
+                  web?.loadUrl(queue[idx])
                   h.removeCallbacks(tick)
-                  h.postDelayed(tick, 2500)
+                  h.postDelayed(tick, 2000)
               }
 
-              private fun fail() {
-                  if (attempt < 2) {
-                      load()
+              private fun nextMethod() {
+                  methodIdx++
+                  if (methodIdx >= methods.size) {
+                      markNotDone()
                       return
                   }
+                  loadCurrent()
+              }
+
+              private fun markNotDone() {
                   done = true
                   h.removeCallbacks(tick)
-                  failList.add(queue[idx])
-                  render()
-                  h.postDelayed({ if (running) next() }, 500)
+                  web?.stopLoading()
+                  notDone.add(queue[idx])
+                  runFail++
+                  save(this)
+                  setStatus("(${idx + 1}/${queue.size}) NOT DONE, skipped", true)
+                  h.postDelayed({ if (running) next() }, 600)
               }
 
               private fun captured(url: String, cd: String?, mime: String?) {
@@ -393,89 +860,57 @@ jobs:
                   ) return
                   done = true
                   h.removeCallbacks(tick)
-                  web.stopLoading()
-                  web.loadUrl("about:blank")
-                  okList.add(name + "\t" + url)
-                  render()
-                  status.text = "(${idx + 1}/${queue.size}) captured: $name"
+                  web?.stopLoading()
+                  web?.loadUrl("about:blank")
+                  ok.add(name + "\t" + url)
+                  runOk++
+                  save(this)
+                  setStatus("(${idx + 1}/${queue.size}) captured: $name", true)
                   h.postDelayed({ if (running) next() }, 800)
               }
 
-              // ---------- results ----------
+              // ---------- finish ----------
 
-              private fun render() {
-                  val sb = StringBuilder()
-                  okList.forEachIndexed { i, e ->
-                      val p = e.split("\t")
-                      sb.append("${i + 1}. ${p[0]}\n${p.getOrElse(1) { "" }}\n\n")
+              private fun teardown() {
+                  h.removeCallbacksAndMessages(null)
+                  try {
+                      val w = web
+                      (w?.parent as? ViewGroup)?.removeView(w)
+                      w?.stopLoading()
+                      w?.destroy()
+                  } catch (_: Exception) {
                   }
-                  if (failList.isNotEmpty()) {
-                      sb.append("FAILED (${failList.size}):\n")
-                      failList.forEach { sb.append(it).append("\n") }
+                  web = null
+                  try {
+                      bubble?.let { if (it.isAttachedToWindow) wm.removeView(it) }
+                  } catch (_: Exception) {
                   }
-                  results.text = if (sb.isEmpty()) "Captured links will appear here." else sb.toString()
-                  prefs.edit()
-                      .putString("ok", okList.joinToString("\n"))
-                      .putString("fail", failList.joinToString("\n"))
-                      .apply()
+                  try {
+                      panel?.let { if (it.isAttachedToWindow) wm.removeView(it) }
+                  } catch (_: Exception) {
+                  }
+                  panel = null
+                  bubble = null
+                  titleTv = null
+                  try {
+                      wake?.let { if (it.isHeld) it.release() }
+                  } catch (_: Exception) {
+                  }
+                  wake = null
               }
 
-              private fun clearAll() {
-                  if (running) {
-                      toast("Stop first")
-                      return
-                  }
-                  okList.clear()
-                  failList.clear()
-                  render()
-              }
-
-              private fun copy(text: String, what: String) {
-                  if (text.isBlank()) {
-                      toast("Nothing to copy")
-                      return
-                  }
-                  (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
-                      .setPrimaryClip(ClipData.newPlainText("links", text))
-                  toast("$what copied")
-              }
-
-              private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
-
-              // ---------- load .txt ----------
-
-              private fun pickFiles() {
-                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                      addCategory(Intent.CATEGORY_OPENABLE)
-                      type = "text/*"
-                      putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-                  }
-                  startActivityForResult(i, 1)
-              }
-
-              @Deprecated("Deprecated in Java")
-              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-                  super.onActivityResult(requestCode, resultCode, data)
-                  if (requestCode != 1 || resultCode != RESULT_OK || data == null) return
-                  val uris = ArrayList<android.net.Uri>()
-                  data.data?.let { uris.add(it) }
-                  data.clipData?.let { c -> for (k in 0 until c.itemCount) uris.add(c.getItemAt(k).uri) }
-                  val sb = StringBuilder(input.text)
-                  for (u in uris) {
-                      try {
-                          val t = contentResolver.openInputStream(u)?.bufferedReader()?.use { it.readText() } ?: ""
-                          if (sb.isNotEmpty()) sb.append("\n")
-                          sb.append(t)
-                      } catch (e: Exception) {
-                          toast("Could not read a file")
-                      }
-                  }
-                  input.setText(sb.toString())
+              private fun finish(msg: String) {
+                  running = false
+                  done = true
+                  teardown()
+                  setStatus(msg)
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
               }
 
               override fun onDestroy() {
-                  h.removeCallbacksAndMessages(null)
-                  web.destroy()
+                  running = false
+                  teardown()
                   super.onDestroy()
               }
           }
